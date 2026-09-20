@@ -42,6 +42,7 @@ export type HookFetch = (url: string, init?: HookFetchInit) => Promise<HookFetch
 
 export type HookConfig = CompactOptions & {
   apiKey?: string;
+  openRouterUrl?: string;
   compactAtPercent: number;
   minReductionRatio: number;
   model: string;
@@ -87,14 +88,40 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   return config;
 }
 
+// Local override (alex): route through OpenRouter when the key is an OpenRouter key (sk-or-…),
+// same endpoint/model/headers as jev-runtime/core/jev.js.
+export const OPENROUTER_URL = 'https://openrouter.ai/api/alpha/decisions';
+export const OPENROUTER_MODEL = 'typesafe/jev-1.13';
+export function isOpenRouterKey(key: string): boolean {
+  return /^sk-or-/.test(key);
+}
+
 /** A `JevAsker` over the engine's `$.http.fetch`. */
-export function jevAsker(fetchFn: HookFetch, apiKey: string, model: string): JevAsker {
+export function jevAsker(
+  fetchFn: HookFetch,
+  apiKey: string,
+  model: string,
+  openRouterUrl: string = OPENROUTER_URL,
+): JevAsker {
+  const viaOpenRouter = isOpenRouterKey(apiKey);
+  const effectiveModel = viaOpenRouter && model === DEFAULT_MODEL ? OPENROUTER_MODEL : model;
   return {
     async ask(state, questions) {
-      const request = buildJevRequest({ apiKey, model }, state, questions);
+      const request = buildJevRequest(
+        { apiKey, model: effectiveModel, ...(viaOpenRouter ? { baseUrl: openRouterUrl } : {}) },
+        state,
+        questions,
+      );
+      const headers = viaOpenRouter
+        ? {
+            ...request.headers,
+            'HTTP-Referer': 'https://github.com/alexxxcoelho',
+            'X-Title': 'fast-jev-compaction',
+          }
+        : request.headers;
       const response = await fetchFn(request.url, {
         method: request.method,
-        headers: request.headers,
+        headers,
         body: request.body,
       });
       return parseJevResponse(response.status, response.ok, response.text);
@@ -167,8 +194,12 @@ export async function compactSession(
   config: HookConfig,
   fetchFn: HookFetch,
 ): Promise<SessionCompaction> {
-  if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
-  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), config);
+  if (!config.apiKey) throw new Error('TYPESAFE_API_KEY / OPENROUTER_API_KEY is not configured');
+  const result = await compact(
+    messages,
+    jevAsker(fetchFn, config.apiKey, config.model, config.openRouterUrl),
+    config,
+  );
   return { result, messages: toSessionMessages(messages, result.messages) };
 }
 
@@ -232,13 +263,17 @@ async function getApiKey(
   config: HookConfig,
 ): Promise<string | undefined> {
   if (config.apiKey) return config.apiKey;
-  const fromEnv = await $.env.get('TYPESAFE_API_KEY');
-  if (fromEnv) return fromEnv;
+  const fromTypesafe = await $.env.get('TYPESAFE_API_KEY');
+  if (fromTypesafe) return fromTypesafe;
+  const fromOpenRouter = await $.env.get('OPENROUTER_API_KEY');
+  if (fromOpenRouter) return fromOpenRouter;
   const settings = await $.settings.read();
   const env = settings['env'];
   if (env && typeof env === 'object') {
-    const value = (env as Record<string, unknown>)['TYPESAFE_API_KEY'];
-    if (typeof value === 'string' && value) return value;
+    for (const name of ['TYPESAFE_API_KEY', 'OPENROUTER_API_KEY']) {
+      const value = (env as Record<string, unknown>)[name];
+      if (typeof value === 'string' && value) return value;
+    }
   }
   return undefined;
 }
@@ -262,7 +297,11 @@ export const register: Register = (on: On, options: PluginOptions) => {
 
   on('session.compact', async ($, event, next) => {
     try {
-      const config = { ...configured, apiKey: await getApiKey($, configured) };
+      const config = {
+        ...configured,
+        apiKey: await getApiKey($, configured),
+        openRouterUrl: (await $.env.get('JEV_OPENROUTER_URL')) || OPENROUTER_URL,
+      };
       const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
         const response = await $.http.fetch(url, init);
         return { status: response.status, ok: response.ok, text: response.text };
